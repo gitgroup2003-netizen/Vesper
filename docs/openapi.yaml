@@ -1,0 +1,206 @@
+openapi: 3.0.3
+info:
+  title: Vesper API
+  version: 0.1.0
+  description: M1 (auth) + M2 (upload to playback) contract. All paths are prefixed with /v1.
+servers:
+  - url: http://localhost:3000/v1
+security:
+  - bearerAuth: []
+paths:
+  /auth/otp/request:
+    post:
+      summary: Send a 6-digit OTP by SMS
+      security: []
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/OtpRequest' } } }
+      responses:
+        '204': { description: Sent }
+        '400': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+  /auth/otp/verify:
+    post:
+      summary: Verify OTP and sign in (creates the account on first use)
+      security: []
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/OtpVerify' } } }
+      responses:
+        '200': { description: Signed in, content: { application/json: { schema: { $ref: '#/components/schemas/AuthResult' } } } }
+        '401': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+  /auth/refresh:
+    post:
+      summary: Rotate the refresh token (reuse of an old token revokes the whole family)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { type: object, required: [refreshToken], properties: { refreshToken: { type: string } } }
+      responses:
+        '200': { description: New tokens, content: { application/json: { schema: { $ref: '#/components/schemas/TokenPair' } } } }
+        '401': { $ref: '#/components/responses/Error' }
+  /videos/uploads:
+    post:
+      summary: Start a resumable multipart upload; returns presigned part URLs
+      requestBody:
+        required: true
+        content: { application/json: { schema: { $ref: '#/components/schemas/CreateUpload' } } }
+      responses:
+        '201': { description: Upload plan, content: { application/json: { schema: { $ref: '#/components/schemas/UploadPlan' } } } }
+        '400': { $ref: '#/components/responses/Error' }
+        '429': { $ref: '#/components/responses/Error' }
+  /videos/{id}/upload:
+    get:
+      summary: Resume an upload; lists uploaded parts and re-presigns the pending ones
+      parameters: [{ $ref: '#/components/parameters/VideoId' }]
+      responses:
+        '200': { description: Upload plan, content: { application/json: { schema: { $ref: '#/components/schemas/UploadPlan' } } } }
+        '409': { $ref: '#/components/responses/Error' }
+  /videos/{id}/complete:
+    post:
+      summary: Finish the upload and start processing (idempotent)
+      parameters: [{ $ref: '#/components/parameters/VideoId' }]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [parts]
+              properties:
+                parts:
+                  type: array
+                  items: { type: object, required: [partNumber, etag], properties: { partNumber: { type: integer }, etag: { type: string } } }
+      responses:
+        '200': { description: Current video state, content: { application/json: { schema: { $ref: '#/components/schemas/Video' } } } }
+        '400': { $ref: '#/components/responses/Error' }
+  /videos/{id}:
+    get:
+      summary: Video state (owner sees any status; others only PUBLISHED)
+      parameters: [{ $ref: '#/components/parameters/VideoId' }]
+      responses:
+        '200': { description: Video, content: { application/json: { schema: { $ref: '#/components/schemas/Video' } } } }
+        '404': { $ref: '#/components/responses/Error' }
+  /feed/for-you:
+    get:
+      summary: Cursor-paginated feed (chronological in M2, ranked from M4)
+      parameters:
+        - { name: cursor, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 30, default: 12 } }
+      responses:
+        '200': { description: Page, content: { application/json: { schema: { $ref: '#/components/schemas/FeedPage' } } } }
+  /events/batch:
+    post:
+      summary: Ingest up to 100 watch-telemetry events
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [events]
+              properties:
+                events: { type: array, minItems: 1, maxItems: 100, items: { $ref: '#/components/schemas/WatchEvent' } }
+      responses:
+        '202': { description: Accepted, content: { application/json: { schema: { type: object, properties: { accepted: { type: integer } } } } } }
+  /webhooks/transcoder:
+    post:
+      summary: Transcoder callback (HMAC-signed by the provider, no bearer auth)
+      security: []
+      responses:
+        '204': { description: Processed }
+        '401': { $ref: '#/components/responses/Error' }
+components:
+  securitySchemes:
+    bearerAuth: { type: http, scheme: bearer, bearerFormat: JWT }
+  parameters:
+    VideoId: { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+  responses:
+    Error:
+      description: Error envelope
+      content:
+        application/json:
+          schema:
+            type: object
+            properties:
+              statusCode: { type: integer }
+              code: { type: string, example: rate_limited }
+              message: { type: string }
+  schemas:
+    OtpRequest:
+      type: object
+      required: [phone]
+      properties: { phone: { type: string, pattern: '^\+[1-9]\d{7,14}$', example: '+256700000000' } }
+    OtpVerify:
+      type: object
+      required: [phone, code]
+      properties: { phone: { type: string }, code: { type: string, minLength: 6, maxLength: 6 } }
+    TokenPair:
+      type: object
+      properties: { accessToken: { type: string }, refreshToken: { type: string }, expiresIn: { type: integer, example: 900 } }
+    AuthResult:
+      allOf:
+        - $ref: '#/components/schemas/TokenPair'
+        - type: object
+          properties:
+            isNewUser: { type: boolean }
+            user: { type: object, properties: { id: { type: string }, username: { type: string, nullable: true }, displayName: { type: string, nullable: true } } }
+    CreateUpload:
+      type: object
+      required: [sizeBytes, contentType]
+      properties:
+        sizeBytes: { type: integer, maximum: 314572800 }
+        contentType: { type: string, enum: [video/mp4, video/quicktime] }
+        durationMs: { type: integer, maximum: 180000 }
+        caption: { type: string, maxLength: 2200 }
+    UploadPlan:
+      type: object
+      properties:
+        videoId: { type: string, format: uuid }
+        partSize: { type: integer, example: 5242880 }
+        totalParts: { type: integer }
+        uploaded: { type: array, items: { type: object, properties: { partNumber: { type: integer }, etag: { type: string } } } }
+        pending: { type: array, items: { type: object, properties: { partNumber: { type: integer }, url: { type: string } } } }
+        expiresInSeconds: { type: integer }
+    Video:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        status: { type: string, enum: [UPLOADING, PROCESSING, MODERATION, PUBLISHED, REJECTED, FAILED] }
+        caption: { type: string }
+        hlsUrl: { type: string, nullable: true }
+        thumbnailUrl: { type: string, nullable: true }
+        durationMs: { type: integer, nullable: true }
+        failureReason: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
+        publishedAt: { type: string, format: date-time, nullable: true }
+    FeedItem:
+      type: object
+      properties:
+        id: { type: string, format: uuid }
+        caption: { type: string }
+        hlsUrl: { type: string }
+        thumbnailUrl: { type: string, nullable: true }
+        durationMs: { type: integer, nullable: true }
+        publishedAt: { type: string }
+        author: { type: object, properties: { id: { type: string }, username: { type: string, nullable: true }, displayName: { type: string, nullable: true } } }
+    FeedPage:
+      type: object
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/FeedItem' } }
+        nextCursor: { type: string, nullable: true }
+    WatchEvent:
+      type: object
+      required: [videoId, type, ts, sessionId]
+      properties:
+        videoId: { type: string, format: uuid }
+        type: { type: string, enum: [impression, play, progress, loop, pause, skip, like, share, view_end] }
+        ts: { type: integer, description: Unix epoch ms }
+        sessionId: { type: string }
+        positionMs: { type: integer }
+        watchedMs: { type: integer }
+        durationMs: { type: integer }
+        loops: { type: integer }
